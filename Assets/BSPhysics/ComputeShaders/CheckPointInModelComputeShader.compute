@@ -1,0 +1,180 @@
+#pragma kernel CheckPoint
+#pragma kernel CheckTetCenter
+#define NUM_THREAD_X 256
+#define PI 3.1415926
+#define FLOAT_EPSILON 1e-6
+#include "Assets/BSPhysics/Bvh.hlsl"
+
+/*Code of random direction*/
+uint Hash(uint seed) {
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+// 生成 [0,1) 范围的随机 float
+float Rand(inout uint seed) {
+    seed = Hash(seed);
+    return float(seed) / 4294967296.0; // 除以 2^32
+}
+
+float3 RandomSphereDirection(uint seed)
+{
+    float theta = Rand(seed)*2.0*PI;
+    float phi = acos(Rand(seed)*2.0-1.0);
+    return float3(cos(theta)*sin(phi),sin(theta)*sin(phi),cos(phi));
+}
+
+
+
+bool PointInModelWithBVH(float3 origin, float3 dir,out float rayScale)
+{
+    int stack[BVH_STACK_SIZE];
+
+    int stackIdx = 0;
+    stack[stackIdx++] = 0;
+
+    rayScale = BVH_FLT_MAX;
+    uint intersectCount = 0;
+    while(stackIdx)
+    {
+        stackIdx--;
+        int BvhIdx = stack[stackIdx];
+        BvhData data = bvhBuffer[BvhIdx];
+
+        if ( LineAABBIntersection(origin, dir, data) )
+         {
+            // Branch node
+            if (data.triangleIdx < 0)
+            {
+                if ( stackIdx+2 >= BVH_STACK_SIZE) return false;
+
+                stack[stackIdx++] = data.leftIdx;
+                stack[stackIdx++] = data.rightIdx;
+            }
+            // Leaf node
+            else
+            {
+                uint triNum = asuint(data.triangleCount);
+                for(uint i=0; i<triNum; ++i)
+                {
+                    BvhTriangle tri = triangleBuffer[i + data.triangleIdx];
+                    float tmpRayScale;
+                    if (LineTriangleIntersection(tri, origin, dir, tmpRayScale,false))
+                    {
+                        intersectCount++;
+                        if (tmpRayScale < rayScale)
+                        {
+                            rayScale = tmpRayScale;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return (intersectCount%2)==1;
+}
+// static const float3 Dirs[] = {float3(1,0,0),float3(-1,0,0),float3(0,1,0),float3(0,-1,0),float3(0,0,1),float3(0,0,-1)};  
+bool RaycastWithBVH(float3 origin,float3 dir,out float rayScale)
+{
+    int stack[BVH_STACK_SIZE];
+
+    int stackIdx = 0;
+    stack[stackIdx++] = 0;
+
+    rayScale = BVH_FLT_MAX;
+    while(stackIdx)
+    {
+        stackIdx--;
+        int BvhIdx = stack[stackIdx];
+        BvhData data = bvhBuffer[BvhIdx];
+        if ( LineAABBIntersection(origin, dir, data) )
+         {
+            // Branch node
+            if (data.triangleIdx < 0)
+            {
+                if ( stackIdx+2 >= BVH_STACK_SIZE) return false;
+
+                stack[stackIdx++] = data.leftIdx;
+                stack[stackIdx++] = data.rightIdx;
+            }
+            // Leaf node
+            else
+            {
+                uint triNum = asuint(data.triangleCount);
+                for(uint i=0; i<triNum; ++i)
+                {
+                    BvhTriangle tri = triangleBuffer[i + data.triangleIdx];
+                    float tmpRayScale;
+                    for(uint j=0;j<6;j++)
+                    {
+                        if (LineTriangleIntersection(tri, origin, dir, tmpRayScale,false))
+                        {
+                            if (tmpRayScale < rayScale)
+                            {
+                                rayScale = tmpRayScale;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return rayScale!=BVH_FLT_MAX;
+}
+StructuredBuffer<float4> pointsBuffer;
+RWStructuredBuffer<int> pointsResultBuffer;
+float minDist;
+[numthreads(NUM_THREAD_X,1,1)]
+void CheckPoint(uint3 id : SV_DispatchThreadID)
+{
+    float3 pos = pointsBuffer[id.x].xyz;
+    float minDistance = BVH_FLT_MAX;
+    uint count = 0;
+    for(uint i=0;i<4;i++)
+    {
+        float distance;
+        uint seed = id.x<<2+i;
+        float3 dir = RandomSphereDirection(seed);
+        if(PointInModelWithBVH(pos,dir,distance))
+        {
+            count++;
+            if(distance<minDistance)
+            {
+                minDistance = distance;
+            }
+        }
+    }
+    if(count>3)
+    {
+        pointsResultBuffer[id.x]=1;
+    }
+}
+StructuredBuffer<float4> verticesBuffer;
+StructuredBuffer<int4> tetsBuffer;
+RWStructuredBuffer<int> tetResultBuffer;
+[numthreads(NUM_THREAD_X,1,1)]
+void CheckTetCenter(uint3 id : SV_DispatchThreadID)
+{
+    int4 tet = tetsBuffer[id.x];
+    float3 center = 0.25*(verticesBuffer[tet.x].xyz+verticesBuffer[tet.y].xyz+verticesBuffer[tet.z].xyz+verticesBuffer[tet.w].xyz);
+    float _;
+    uint count = 0;
+    for(uint i=0;i<4;i++)
+    {
+        float distance;
+        uint seed = id.x<<2+i;
+        float3 dir = RandomSphereDirection(seed);
+        if(PointInModelWithBVH(center,dir,_))
+        {
+            count++;
+        }
+    }
+    if(count>3)
+    {
+        tetResultBuffer[id.x] = 1;
+    }
+}
+

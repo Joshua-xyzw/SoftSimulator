@@ -1,0 +1,323 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel GetMeshVtxArgs
+#pragma kernel SetBufferData
+#pragma kernel PreSolve
+#pragma kernel SolveHeights
+#pragma kernel SolveEdges
+#pragma kernel SolveVolumes
+#pragma kernel MergeResults
+#pragma kernel PostSolve
+#pragma kernel ApplyMeshVertex
+
+#define NUM_THREAD 256
+#define FLT_MAX 3.402823466e+38f
+#define FLT_EPSLON 1e-18
+#define RELAX_FACTOR 1.9f
+
+
+struct Tet
+{
+    int4 index;
+    float volume;
+};
+
+struct Edge
+{
+    int2 index;
+    float length;
+};
+
+struct VtxResult
+{
+    float4 bc;//Barycentric coordinates
+    uint tetIdx;
+};
+float SignedVolume(float3 a, float3 b, float3 c, float3 d) 
+{
+    return dot(d - a, cross(c - a, b - a)) / 6.0;
+}
+float4 GetBaryCentroidCoodinate(float3 p0,float3 p1,float3 p2,float3 p3,float3 p,float v)
+{
+    if(abs(v) < FLT_EPSLON) {return float4(-1,-1,-1,-1);}
+    float w0 = SignedVolume(p,p1,p2,p3)/v;
+    float w1 = SignedVolume(p0,p,p2,p3)/v;
+    float w2 = SignedVolume(p0,p1,p,p3)/v;
+    float w3 = 1-w0-w1-w2;
+    return float4(w0,w1,w2,w3);
+}
+int3 WorldToCell(float3 pos, float3 cellSize)
+{
+    return int3(
+        floor(pos.x / cellSize.x),
+        floor(pos.y / cellSize.y),
+        floor(pos.z / cellSize.z)
+    );
+}
+//const
+static const float4 GRAVITY = float4(0,-10.0,0,0);
+static const uint TETORDER[4][3] = {  { 1, 3, 2 }, { 0, 2, 3 }, { 0, 3, 1 },{ 0, 1, 2 }};
+//variable
+uint tetVtxCount;
+uint tetCount;
+uint edgeCount;
+uint meshVtxStride;
+int4 cellOriginArray;//where do cell start
+int4 cellCountArray ;//cell num
+Vector cellSizeVector;//cell size
+//EveryFrame
+float edgeCompliance;
+float volumeCompliance;
+float dt;//delta time
+//Buffer
+StructuredBuffer<float4> tetVtxOriginBuffer;
+StructuredBuffer<Tet> tetsBuffer;//tet index
+StructuredBuffer<Edge> edgesBuffer;
+StructuredBuffer<int> cellsToTetsBuffer;//data spatial cells
+StructuredBuffer<int> cellsToTetsOffsetBuffer;
+StructuredBuffer<uint> vertsToEdgesBuffer;
+StructuredBuffer<int> vertsToEdgesOffsetBuffer;
+StructuredBuffer<uint>  vertsToTetsBuffer;
+StructuredBuffer<int>  vertsToTetsOffsetBuffer;
+//simulate
+StructuredBuffer<float4x4> localToWorldMatBuffer;
+StructuredBuffer<float4x4> worldToLocalMatBuffer;
+RWStructuredBuffer<float4> tetVtxPosBuffer;
+RWStructuredBuffer<float4> tetVtxTempPosBuffer; //temp result of PreSolve
+RWStructuredBuffer<float4> tetVtxVelocityBuffer;
+RWStructuredBuffer<float4> edgeSolveResultBuffer;
+RWStructuredBuffer<float4> volumeSolveResultBuffer;
+//data of real mesh
+RWByteAddressBuffer meshVtxBuffer;//vertex buffer of real mesh.Change this will change the mesh.
+RWStructuredBuffer<VtxResult> meshVtxArgsBuffer;//mesh vertx barycentric coordinates in the tet.
+
+//for every vertex,get its barycentric coordinates in every tet
+[numthreads(NUM_THREAD,1,1)]
+void GetMeshVtxArgs(uint3 id:SV_DispatchThreadID)
+{
+    uint vertexIndex = id.x;
+    //id*stride means position in the vertex buffer,offset 0=vertex,offset 12=normal,offset 40=UV
+    float4 vertexPos = asfloat(meshVtxBuffer.Load4(vertexIndex*meshVtxStride));
+    float3 cellSize = float3(cellSizeVector.x,cellSizeVector.y,cellSizeVector.z);
+    int3 cellCount = int3(cellCountArray[0],cellCountArray[1],cellCountArray[2]);
+    int3 cellOrigin = int3(cellOriginArray[0],cellOriginArray[1],cellOriginArray[2]);
+    int3 cellCoord = WorldToCell(vertexPos.xyz,cellSize);
+    int3 localCoord = cellCoord - cellOrigin;
+    clamp(localCoord,int3(0,0,0),cellCount-int3(1,1,1));
+    uint cellIndex = localCoord.x * (cellCount.y * cellCount.z) 
+                   + localCoord.y * cellCount.z 
+                   + localCoord.z;
+    uint cellStart = cellsToTetsOffsetBuffer[cellIndex];
+    uint cellEnd =  cellsToTetsOffsetBuffer[cellIndex+1];
+    //if the cell is empty,move towards center,but limit the cycle count
+    uint count = 0;
+    while(cellStart!=cellEnd && count<3)
+    {
+       float3 offset = float3(0.5,0.5,0.5)-((float3)localCoord)/cellCount;
+       float3 absOffset = abs(offset);
+       float isX = step(max(absOffset.y,absOffset.z),absOffset.z);
+       float isY = step(absOffset.z, absOffset.y) * (1 - isX);
+       float isZ = 1-isX-isY;
+       localCoord += float3(isX,isY,isZ)*sign(offset);
+       clamp(localCoord,int3(0,0,0),cellCount-int3(1,1,1));
+       cellIndex = localCoord.x * (cellCount.y * cellCount.z) 
+                      + localCoord.y * cellCount.z 
+                      + localCoord.z;
+       uint cellStart = cellsToTetsOffsetBuffer[cellIndex];
+       uint cellEnd =  cellsToTetsOffsetBuffer[cellIndex+1];
+       count++;     
+    }
+    float maxMinBary = -FLT_MAX;
+    float4 bestBary;
+    uint bestTetIndex = 0xFFFFFFFF;
+    uint tetIndex;
+    for (uint i = cellStart; i < cellEnd; i++) {
+        tetIndex = cellsToTetsBuffer[i];
+        Tet tet = tetsBuffer[tetIndex];
+        float3 p0 = tetVtxPosBuffer[tet.index[0]].xyz;
+        float3 p1 = tetVtxPosBuffer[tet.index[1]].xyz;
+        float3 p2 = tetVtxPosBuffer[tet.index[2]].xyz;
+        float3 p3 = tetVtxPosBuffer[tet.index[3]].xyz;
+        float4 bary = GetBaryCentroidCoodinate(p0,p1,p2,p3,vertexPos.xyz,tet.volume);
+        float minBary = min(min(bary.x, bary.y), min(bary.z, bary.w));
+        if (all(bary >= -1e-5) && abs(1.0 - dot(bary, 1.0)) < 1e-5) {
+            VtxResult result;
+            result.bc = bary;
+            result.tetIdx = tetIndex;
+            meshVtxArgsBuffer[vertexIndex] = result;
+            return; 
+        }
+        if (minBary > maxMinBary) {
+            maxMinBary = minBary;
+            bestBary = bary;
+            bestTetIndex = tetIndex;
+        }
+    }
+    VtxResult result;
+    result.bc = bestBary;
+    result.tetIdx = bestTetIndex;
+    meshVtxArgsBuffer[vertexIndex] = result;;
+}
+
+
+[numthreads(NUM_THREAD,1,1)]
+void SetBufferData(uint3 id:SV_DispatchThreadID)
+{
+    if(id.x>tetVtxCount) return;//over the boarder check
+    uint index = id.y*tetVtxCount+id.x;
+    tetVtxPosBuffer[index] = tetVtxOriginBuffer[id.x];
+}
+
+
+[numthreads(NUM_THREAD,1,1)]
+void PreSolve(uint3 id:SV_DispatchThreadID)//Per tet vertex
+{
+    if(id.x>tetVtxCount) return;
+    uint index = id.y*tetVtxCount+id.x;
+    float4 position = tetVtxPosBuffer[index];
+    float4 velocity = tetVtxVelocityBuffer[index];
+    velocity += mul(worldToLocalMatBuffer[id.y],GRAVITY)*dt;
+    // velocity += GRAVITY*dt;
+    position += velocity*dt;
+    tetVtxTempPosBuffer[index] = position; 
+}
+
+[numthreads(NUM_THREAD,1,1)]
+void SolveHeights(uint3 id:SV_DispatchThreadID)//per tet vertex
+{
+    if(id.x>tetVtxCount) return;
+    uint index = id.y*tetVtxCount+id.x;
+    float4 prevPos = tetVtxPosBuffer[index];
+    float4 position = tetVtxTempPosBuffer[index]; 
+    float4 worldPos = mul(localToWorldMatBuffer[id.y],position);
+    if(worldPos.y< 0) //world coordinate
+    {
+        worldPos = float4(worldPos.x,0,worldPos.z,1);
+        float newY = mul(worldToLocalMatBuffer[id.y],worldPos).y;
+        position = float4(prevPos.x,newY,prevPos.z,1);
+        tetVtxTempPosBuffer[index] = position; 
+    }
+}
+
+//Jocobi solve edges
+[numthreads(NUM_THREAD,1,1)]
+void SolveEdges(uint3 id:SV_DispatchThreadID)//per tet
+{
+    if(id.x>edgeCount) return;
+    float aplha = edgeCompliance/dt/dt;
+    Edge edge  = edgesBuffer[id.x];
+    int2 index = edge.index;
+    float rest = edge.length;
+    int index0 = index.x;
+    int index1 = index.y;
+    float3 pos0 = tetVtxTempPosBuffer[id.y*tetVtxCount+index0].xyz;//caution!y is the index of object
+    float3 pos1 = tetVtxTempPosBuffer[id.y*tetVtxCount+index1].xyz;
+    float w0 = 1;
+    float w1 = 1;
+    float w = w0+w1;
+    if(w == 0) return;
+    float3 grad = pos1-pos0;
+    float len = length(grad);
+    if(len< FLT_EPSLON) return;//overlay vertex
+    grad/=len;
+    float c = len-rest; 
+    edgeSolveResultBuffer[(id.y*edgeCount+id.x)*2]=float4(grad*c*w0/(w+aplha),0);
+    edgeSolveResultBuffer[(id.y*edgeCount+id.x)*2+1] =float4(-grad*c*w1/(w+aplha),0);
+}
+//Jocobi solve tets
+[numthreads(NUM_THREAD,1,1)]
+void SolveVolumes(uint3 id:SV_DispatchThreadID)
+{
+    if(id.x>tetCount) return;
+    float aplha = volumeCompliance/dt/dt;
+    Tet tet = tetsBuffer[id.x];
+    int4 index = tet.index;
+    float restV = tet.volume;
+    float3 tetVertices[] = 
+    {
+        tetVtxTempPosBuffer[id.y*tetVtxCount+index.x].xyz,
+        tetVtxTempPosBuffer[id.y*tetVtxCount+index.y].xyz,
+        tetVtxTempPosBuffer[id.y*tetVtxCount+index.z].xyz,
+        tetVtxTempPosBuffer[id.y*tetVtxCount+index.w].xyz
+    };
+    float rest = tet.volume;
+    float3 grads[4]; 
+    float w = 0;
+    for(uint i =0;i<4;i++)
+    {
+        float3 p0 = tetVertices[TETORDER[i][0]];
+        float3 p1 = tetVertices[TETORDER[i][1]];
+        float3 p2 = tetVertices[TETORDER[i][2]];
+        float3 grad = cross(p1-p0,p2-p0)/6.0;
+        w+= dot(grad,grad)*1;//mass set to 1
+        grads[i] = grad;
+    }
+    float v = SignedVolume(tetVertices[0],tetVertices[1],tetVertices[2],tetVertices[3]);
+    if(w==0)return;
+    float lambda = (v-restV)/(w+aplha);
+    for(uint j =0;j<4;j++)
+    {
+        int savePos = 4*(tetCount*id.y+id.x)+j;
+        volumeSolveResultBuffer[savePos] = float4(lambda*1*grads[j],0);//1 means invmass
+    }
+}
+[numthreads(NUM_THREAD,1,1)]
+void MergeResults(uint3 id:SV_DispatchThreadID)
+{
+    if(id.x>tetVtxCount) return;
+    float4 edgeFix = float4(0,0,0,0);
+    uint edgeStart = vertsToEdgesOffsetBuffer[id.x];
+    uint edgeEnd = vertsToEdgesOffsetBuffer[id.x+1];
+    for(uint edgeIndex=edgeStart;edgeIndex<edgeEnd;edgeIndex++)
+    {
+        uint link = vertsToEdgesBuffer[edgeIndex];
+        uint edge = link>>1;
+        uint offset = link&0x1;
+        edgeFix += edgeSolveResultBuffer[2*(id.y*edgeCount+edge)+offset];
+    }
+    if(edgeEnd-edgeStart>0)
+    {
+        edgeFix = RELAX_FACTOR*edgeFix/(edgeEnd-edgeStart);
+    }
+    float4 volumeFix = float4(0,0,0,0);
+    uint tetStart = vertsToTetsOffsetBuffer[id.x];
+    uint tetEnd = vertsToTetsOffsetBuffer[id.x+1];
+    for(uint tetIndex=tetStart;tetIndex<tetEnd;tetIndex++)
+    {
+        uint link = vertsToTetsBuffer[tetIndex];
+        uint tet = link >> 2;
+        uint offset = link & 0x3;
+        volumeFix += volumeSolveResultBuffer[4*(id.y*tetCount+tet)+offset];
+    }
+    if(tetEnd-tetStart>0)
+    {
+        volumeFix = RELAX_FACTOR*volumeFix/(tetEnd-tetStart);
+    }
+    uint index = id.y*tetVtxCount+id.x;
+    tetVtxTempPosBuffer[index] = tetVtxTempPosBuffer[index]+edgeFix+volumeFix;
+}
+//Combine all solve result,update position,update velocity 
+[numthreads(NUM_THREAD,1,1)]
+void PostSolve(uint3 id:SV_DispatchThreadID)
+{
+    if(id.x>tetVtxCount) return;
+    uint index = id.y*tetVtxCount+id.x;
+    float4 pos = tetVtxTempPosBuffer[index];
+    float4 prevPos = tetVtxPosBuffer[index];
+    float4 velocity = (pos-prevPos)/dt;
+    tetVtxPosBuffer[index] = pos;//write position
+    tetVtxVelocityBuffer[index] = velocity;//write velocity
+}
+int objectIndex;
+[numthreads(NUM_THREAD,1,1)]
+void ApplyMeshVertex(uint3 id:SV_DispatchThreadID)
+{
+    float4 pos = float4(0,0,0,0);
+    VtxResult result = meshVtxArgsBuffer[id.x];
+    float4 bc = result.bc;
+    uint tetIndex = result.tetIdx;
+    for(uint i =0;i<4;i++)
+    {
+        pos += bc[i] * tetVtxPosBuffer[objectIndex*tetVtxCount+tetsBuffer[tetIndex].index[i]];
+    }
+    meshVtxBuffer.Store4(id.x*meshVtxStride,asuint(pos));
+}
